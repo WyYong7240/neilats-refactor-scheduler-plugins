@@ -1,0 +1,71 @@
+# Default values for scheduler-plugins-as-a-second-scheduler.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+scheduler:
+  name: neilats-refactor-scheduler
+  image: wuyong7240/scheduler-plugins/neilats-refactor-scheduler:v2.8
+  replicaCount: 1
+  leaderElect: false
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+
+controller:
+  name: neilats-refactor-controller
+  image: wuyong7240/scheduler-plugins/neilats-refactor-controller:v2.8
+  replicaCount: 1
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+
+# LoadVariationRiskBalancing and TargetLoadPacking are not enabled by default
+# as they need extra RBAC privileges on metrics.k8s.io.
+
+plugins:
+  enabled: ["Coscheduling","CapacityScheduling","NodeResourceTopologyMatch","NodeResourcesAllocatable","NeilatsRefactorScheduler"]
+  disabled: ["PrioritySort"] # only in-tree plugins need to be defined here
+
+# Customize the enabled plugins' config.
+# Refer to the "pluginConfig" section of manifests/<plugin>/scheduler-config.yaml.
+# For example, for Coscheduling plugin, you want to customize the permit waiting timeout to 10 seconds:
+pluginConfig:
+- name: Coscheduling
+  args:
+    permitWaitingTimeSeconds: 10 # default is 60
+- name: NeilatsRefactorScheduler
+  args:
+    prometheusAddress: "http://192.168.3.226:31739"
+    networkDevice:
+      master: "ens18"
+      node1: "ens18"
+      node2: "ens18"
+      node3: "ens18"
+    storageDevice:
+      master: "/dev/mapper/ubuntu--vg-ubuntu--lv"
+      node1: "/dev/mapper/ubuntu--vg-ubuntu--lv"
+      node2: "/dev/mapper/ubuntu--vg-ubuntu--lv"
+      node3: "/dev/mapper/ubuntu--vg-ubuntu--lv"
+    enableSLA: true
+    kubeNodeAddressAndSecret:
+      master:
+        nodeAddress: "192.168.3.226"
+        nodeSecret: "mobisys912"
+      node1:
+        nodeAddress: "192.168.3.229"
+        nodeSecret: "mobisys912"
+      node2:
+        nodeAddress: "192.168.3.224"
+        nodeSecret: "mobisys912"
+      node3:
+        nodeAddress: "192.168.3.228"
+        nodeSecret: "mobisys912"
+# Or, customize the other plugins
+# - name: NodeResourceTopologyMatch
+#   args:
+#     scoringStrategy:
+#       type: MostAllocated # default is LeastAllocated
+#- name: SySched
+#  args:
+#    defaultProfileNamespace: "default"
+#    defaultProfileName: "full-seccomp"
