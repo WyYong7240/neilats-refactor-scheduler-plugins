@@ -345,6 +345,7 @@ func autoConvert_v1_NeilatsRefactorSchedulerArgs_To_config_NeilatsRefactorSchedu
 	out.StorageDevice = *(*map[string]string)(unsafe.Pointer(&in.StorageDevice))
 	out.EnableSLA = in.EnableSLA
 	out.KubeNodeAddressAndSecret = *(*map[string]config.UserAddressSecretMap)(unsafe.Pointer(&in.KubeNodeAddressAndSecret))
+	out.LstmAdfModuleAddress = in.LstmAdfModuleAddress
 	return nil
 }
 
@@ -359,6 +360,7 @@ func autoConvert_config_NeilatsRefactorSchedulerArgs_To_v1_NeilatsRefactorSchedu
 	out.StorageDevice = *(*map[string]string)(unsafe.Pointer(&in.StorageDevice))
 	out.EnableSLA = in.EnableSLA
 	out.KubeNodeAddressAndSecret = *(*map[string]UserAddressSecretMap)(unsafe.Pointer(&in.KubeNodeAddressAndSecret))
+	out.LstmAdfModuleAddress = in.LstmAdfModuleAddress
 	return nil
 }
 

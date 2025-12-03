@@ -25,8 +25,8 @@ import (
 // 声明自定义调度器的自定义参数结构体
 // 调度器添加自定义参数的方法，参考了其他调度插件中的pkg/nodeResources的实现方法
 type UserAddressSecretMap struct {
-	NodeAddress string	`json:"nodeAddress"`
-	NodeSecret  string	`json:"nodeSecret"`
+	NodeAddress string `json:"nodeAddress"`
+	NodeSecret  string `json:"nodeSecret"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -40,8 +40,8 @@ type NeilatsRefactorSchedulerArgs struct {
 	StorageDevice            map[string]string               `json:"storageDevice"`
 	EnableSLA                bool                            `json:"enableSLA"`
 	KubeNodeAddressAndSecret map[string]UserAddressSecretMap `json:"kubeNodeAddressAndSecret"`
+	LstmAdfModuleAddress     string                          `json:"lstmAdfModuleAddress"`
 }
-
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
