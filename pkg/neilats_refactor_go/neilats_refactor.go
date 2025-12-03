@@ -1,10 +1,14 @@
 package neilats_refactor_go
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
+	"net/http"
 	"strconv"
 
 	v1 "k8s.io/api/core/v1"
@@ -393,17 +397,107 @@ func (neilats *NeilatsRefactorScheduler) LBScore(p *v1.Pod, nodeName string) (fl
 }
 
 func (neilats *NeilatsRefactorScheduler) ADFScore(nodeFrom, nodeTo string) (float64, error) {
-	var ADFScore float64 = 0
-	// neiNodeValue, neiNodeExist := p.GetLabels()["nei_node"]
+	nodeFromUASMap := neilats.config.KubeNodeAddressAndSecret[nodeFrom]
+	nodeToUASMap := neilats.config.KubeNodeAddressAndSecret[nodeTo]
+	// 获取两个节点之间的最后30行延迟数据，依据此得到ADF分数
+	lastNLatency, err := getLastLinesLatencyFromSSH(nodeFrom, nodeFromUASMap.NodeAddress, nodeFromUASMap.NodeSecret, nodeToUASMap.NodeAddress, 30)
+	if err != nil {
+		log.Printf("ADF Get Last N Lines Latency Failed, From Node %s To %s:%v", nodeFrom, nodeTo, err)
+		return 0, err
+	}
+	// 定义获取ADF分数的结构体
+	type ADFRequest struct {
+		Latency []float64 `json:"latency"`
+	}
 
+	reqBody := ADFRequest{
+		Latency: lastNLatency,
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		log.Printf("Error ADF Marshaling JSON: %v\n", err)
+		return 0, err
+	}
+	ADFScore, err := neilats.sendHTTPRequest(jsonData, "/adf_score")
+	if err != nil {
+		log.Printf("Error ADF Get ADFScore from RemoteServer: %v", err)
+		return 0, err
+	}
 	return ADFScore, nil
 }
 
 func (neilats *NeilatsRefactorScheduler) FutureScore(nodeFrom, nodeTo string, slaTime float64) (float64, error) {
-	var FutureScore float64 = 0
-	// neiNodeValue, neiNodeExist := p.GetLabels()["nei_node"]
+	nodeFromUASMap := neilats.config.KubeNodeAddressAndSecret[nodeFrom]
+	nodeToUASMap := neilats.config.KubeNodeAddressAndSecret[nodeTo]
+	lastNLatency, err := getLastLinesLatencyFromSSH(nodeFrom, nodeFromUASMap.NodeAddress, nodeFromUASMap.NodeSecret, nodeToUASMap.NodeAddress, 30)
+	if err != nil {
+		log.Printf("ADF Get Last N Lines Latency Failed, From Node %s To %s:%v", nodeFrom, nodeTo, err)
+		return 0, err
+	}
+	// 定义未来链路得分结构体
+	type FutureRequest struct {
+		Latency []float64 `json:"latency"`
+		SLATime float64   `json:"sla_time"`
+	}
 
+	reqBody := FutureRequest{
+		Latency: lastNLatency,
+		SLATime: slaTime,
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		log.Printf("Error FutureScore Marshaling JSON: %v\n", err)
+		return 0, err
+	}
+	FutureScore, err := neilats.sendHTTPRequest(jsonData, "/predict/"+nodeFrom+"2"+nodeTo)
+	if err != nil {
+		log.Printf("Error Future Get FutureScore from RemoteServer: %v", err)
+		return 0, err
+	}
 	return FutureScore, nil
+}
+
+func (neilats *NeilatsRefactorScheduler) sendHTTPRequest(reqBodyData []byte, serverAddress string) (float64, error) {
+	url := neilats.config.LstmAdfModuleAddress + serverAddress
+
+	// 创建请求
+	request, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBodyData))
+	if err != nil {
+		log.Printf("Error Creating requests: %v\n", err)
+		return 0, err
+	}
+
+	// 设置Header
+	request.Header.Set("Content-Type", "application/json")
+
+	// 发送请求
+	client := &http.Client{}
+	response, err := client.Do(request)
+	if err != nil {
+		log.Printf("Error Sending Request: %v\n", err)
+		return 0, err
+	}
+	defer response.Body.Close()
+
+	// 定义响应体结构体，用于接收数据
+	type ResponseType struct {
+		Score float64
+	}
+
+	// 读取响应体
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		log.Printf("Error Read Response Body: %v\n", err)
+	}
+	// 解析响应体
+	var result ResponseType
+	err = json.Unmarshal(body, &result)
+	if err != nil {
+		log.Printf("Error Failed to pares JSON: %v\n", err)
+		log.Printf("Raw response %s\n", string(body))
+		return 0, err
+	}
+	return result.Score, nil
 }
 
 func (neilats *NeilatsRefactorScheduler) ScoreExtensions() framework.ScoreExtensions {
