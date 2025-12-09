@@ -4,7 +4,7 @@
 
 scheduler:
   name: neilats-refactor-scheduler
-  image: wuyong7240/scheduler-plugins/neilats-refactor-scheduler:v2.8
+  image: wuyong7240/scheduler-plugins/neilats-refactor-scheduler:v3beta2
   replicaCount: 1
   leaderElect: false
   nodeSelector: {}
@@ -13,7 +13,7 @@ scheduler:
 
 controller:
   name: neilats-refactor-controller
-  image: wuyong7240/scheduler-plugins/neilats-refactor-controller:v2.8
+  image: wuyong7240/scheduler-plugins/neilats-refactor-controller:v3beta2
   replicaCount: 1
   nodeSelector: {}
   affinity: {}
@@ -60,6 +60,7 @@ pluginConfig:
       node3:
         nodeAddress: "192.168.3.228"
         nodeSecret: "mobisys912"
+    lstmAdfModuleAddress: "http://192.168.3.212:30080"
 # Or, customize the other plugins
 # - name: NodeResourceTopologyMatch
 #   args:

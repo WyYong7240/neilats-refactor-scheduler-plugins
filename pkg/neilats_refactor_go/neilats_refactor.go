@@ -1,16 +1,21 @@
 package neilats_refactor_go
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"strconv"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"log"
-	"math"
 	"sigs.k8s.io/scheduler-plugins/apis/config"
-	"strconv"
 )
 
 const Name = "NeilatsRefactorScheduler"
@@ -26,79 +31,12 @@ type NeilatsRefactorScheduler struct {
 var _ framework.PreFilterPlugin = &NeilatsRefactorScheduler{}
 var _ framework.FilterPlugin = &NeilatsRefactorScheduler{}
 var _ framework.ScorePlugin = &NeilatsRefactorScheduler{}
+var _ framework.PreScorePlugin = &NeilatsRefactorScheduler{}
 
-// 声明自定义调度器的自定义参数结构体
-// 调度器添加自定义参数的方法，参考了其他调度插件中的pkg/nodeResources的实现方法
-//type UserAddressSecretMap struct {
-//	NodeAddress string
-//	NodeSecret  string
-//}
-
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
-// NeilatsRefactorSchedulerArgs holds arguments used to configure NeilatsRefactorScheduler plugin.
-//type NeilatsRefactorSchedulerArgs struct {
-//	// 如果自定义调度器有参数，需要参数结构体添加该内联类型，是Kubernetes库的要求
-//	metav1.TypeMeta          `json:",inline"`
-//	PrometheusAddress        string                          `json:"prometheusAddress"`
-//	NetworkDevice            map[string]string               `json:"networkDevice"`
-//	StorageDevice            map[string]string               `json:"storageDevice"`
-//	EnableSLA                bool                            `json:"enableSLA"`
-//	KubeNodeAddressAndSecret map[string]UserAddressSecretMap `json:"kubeNodeAddressAndSecret"`
-//}
-
-// 如果自定义调度器有参数，需要参数结构体实现runtime.Object类型的接口
-//var _ runtime.Object = &NeilatsRefactorSchedulerArgs{}
-
-// 需要实现DeepCopyObject、DeepCopyInto这两个接口， 是Kubernetes架构设计与代码生成工具的要求
-// 该结构体要被设计为可以被序列化、反序列化、在组件之间传递，并且可以安全的拷贝
-// 这两个方法也可以通过code-generator来自动生成
-//func (in *NeilatsRefactorSchedulerArgs) DeepCopyInto(out *NeilatsRefactorSchedulerArgs) {
-//	*out = *in
-//	out.TypeMeta = in.TypeMeta
-//
-//	// 拷贝基本字段
-//	out.PrometheusAddress = in.PrometheusAddress
-//	out.EnableSLA = in.EnableSLA
-//
-//	// 拷贝map[string]string
-//	if in.NetworkDevice != nil {
-//		out.NetworkDevice = make(map[string]string, len(in.NetworkDevice))
-//		for k, v := range in.NetworkDevice {
-//			out.NetworkDevice[k] = v
-//		}
-//	}
-//	if in.StorageDevice != nil {
-//		out.StorageDevice = make(map[string]string, len(in.StorageDevice))
-//		for k, v := range in.StorageDevice {
-//			out.StorageDevice[k] = v
-//		}
-//	}
-//	if in.KubeNodeAddressAndSecret != nil {
-//		out.KubeNodeAddressAndSecret = make(map[string]UserAddressSecretMap, len(in.KubeNodeAddressAndSecret))
-//		for k, v := range in.KubeNodeAddressAndSecret {
-//			out.KubeNodeAddressAndSecret[k] = UserAddressSecretMap{NodeAddress: v.NodeAddress, NodeSecret: v.NodeSecret}
-//		}
-//	}
-//	return
-//}
-//
-//func (in *NeilatsRefactorSchedulerArgs) DeepCopy() *NeilatsRefactorSchedulerArgs {
-//	if in == nil {
-//		return nil
-//	}
-//	out := new(NeilatsRefactorSchedulerArgs)
-//	in.DeepCopyInto(out)
-//	return out
-//}
-//
-//// 需要参数结构体实现DeepCopyObject接口
-//func (in *NeilatsRefactorSchedulerArgs) DeepCopyObject() runtime.Object {
-//	if c := in.DeepCopy(); c != nil {
-//		return c
-//	}
-//	return nil
-//}
+// 负载均衡得分、ADF网络平稳性得分、FutureScore未来链路得分存储
+var LBScoreMap map[string]float64
+var ADFScoreMap map[string]float64
+var FutureScoreMap map[string]float64
 
 // 返回插件名称
 func (neilats *NeilatsRefactorScheduler) Name() string {
@@ -129,6 +67,7 @@ func New(neilatsArgs runtime.Object, h framework.Handle) (framework.Plugin, erro
 			"node2":  {"192.168.3.224", "mobisys912"},
 			"node3":  {"192.168.3.228", "mobisys912"},
 		}, // 由于默认不开启SLA约束，所以不要求kubeNodeAddressAndSecret参数
+		LstmAdfModuleAddress: "http://192.168.3.226:30080", // 默认LSTM预测服务与ADF分数计算服务地址
 	}
 
 	// 如果参数neilatsArgs不为空，则尝试解析其中的配置参数
@@ -172,13 +111,9 @@ func New(neilatsArgs runtime.Object, h framework.Handle) (framework.Plugin, erro
 			}
 			log.Printf("Start Latency Test Success!\n")
 
-			// 此处存在一个问题，子程序与主程序关系紧密（指子程序的启动与主程序相关）又疏远（子程序仅仅帮助主程序生成与修改文件）那么这种情况应该使用goroutine线程实现还是多进程实现？
-			// 此处产生一个设想，能否在仅仅调度具有SLA需求的Pod时，才下载一次远程主机上的延迟测试文件，才进行一轮rttMatrix矩阵文件的构建
-			// 但是让远程主机上的延迟测试一直运行，这样不仅能够省去rttMatrix文件，还可以省去多线程、文件锁等复杂操作
-			// 开始不断间隔下载延迟测试结果文件
-			//go GetLatencyTestResultInterval(defaultConfig.KubeNodeAddressAndSecret)
-			// 开始构建rttMatrix文件
-			//go BuildRtt(defaultConfig.KubeNodeAddressAndSecret)
+		}
+		if args.LstmAdfModuleAddress != "" {
+			defaultConfig.LstmAdfModuleAddress = args.LstmAdfModuleAddress
 		}
 	}
 
@@ -260,21 +195,20 @@ func (neilats *NeilatsRefactorScheduler) Filter(ctx context.Context, state *fram
 			return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Failed Convert SLAConstraint Str to Float64:%v", err))
 		}
 
-		// 进行一次延迟测试文件的下载
-		// 后面由于采用了远程打开文件读取数据的方式，所以就不用下载了
-		//if err := DownloadLatencyTestResult(neilats.config.KubeNodeAddressAndSecret); err != nil {
-		//	return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Failed Download Latency Test Result:%v", err))
-		//}
+		// 如果邻近节点与当前节点一致，不予通过，即Pod不可调度到邻近节点上
+		if neiNodeValue == nodeInfo.Node().Name {
+			log.Printf("Pod Nei_Node %s is Same As Current Node!", neiNodeValue)
+			return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Failed Build RttMatrix:%v", err))
+		}
 
 		// 构建一次RttMatrix
-		//rttMatrix, err := BuildRttWithOutFile(neilats.config.KubeNodeAddressAndSecret)
 		rttMatrix, err := BuildRttWithOutFileOnRemote(neilats.config.KubeNodeAddressAndSecret)
 		if err != nil {
 			log.Printf("Failed Build RttMatrix:%v\n", err)
 			return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Failed Build RttMatrix:%v", err))
 		}
 
-		// 根据RttMatrix，筛选满足Pod的SLA要求的Pod
+		// 根据RttMatrix，筛选满足Pod的SLA要求的Node
 		if rttMatrix[nodeInfo.Node().Name][neiNodeValue] <= SLAConstraintValue {
 			log.Printf("Node %s rtt Satisfy Pod %s SLA Constraint\n", nodeInfo.Node().Name, pod.Name)
 			return framework.NewStatus(framework.Success, "Node "+nodeInfo.Node().Name+" rtt Satisfy Pod "+pod.Name+" SLA Constraint")
@@ -287,16 +221,110 @@ func (neilats *NeilatsRefactorScheduler) Filter(ctx context.Context, state *fram
 	return framework.NewStatus(framework.Success, "Node:"+nodeInfo.Node().Name)
 }
 
-func (neilats *NeilatsRefactorScheduler) Score(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) (int64, *framework.Status) {
-	LBScore, err := neilats.LBScore(p, nodeName)
-	if err != nil {
-		return 0, framework.NewStatus(framework.Error, err.Error())
+// 预先计算每个节点的三种得分
+func (neilats *NeilatsRefactorScheduler) PreScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) *framework.Status {
+	// 初始化各个节点不同得分Map
+	nodeNum := len(nodes)
+	LBScoreMap = make(map[string]float64, nodeNum)
+	ADFScoreMap = make(map[string]float64, nodeNum)
+	FutureScoreMap = make(map[string]float64, nodeNum)
+
+	// 找出各个分数值的极值，用于归一化
+	var LBMax, ADFMax, FutureMax float64 = float64(math.MinInt64), float64(math.MinInt64), float64(math.MinInt64)
+	var LBMin, ADFMin, FutureMin float64 = math.MaxFloat64, math.MaxFloat64, math.MaxFloat64
+
+	// 检查Pod是否存在邻近节点标签
+	neiNodeValue, neiNodeExist := pod.GetLabels()["nei_node"]
+	// 检查Pod是否存在SLA约束要求标签
+	slaConstraintValue, slaExist := pod.GetLabels()["sla"]
+
+	for _, node := range nodes {
+		// 预先计算各个节点的负载均衡得分
+		nodeLBscore, err := neilats.LBScore(pod, node.Name)
+		if err != nil {
+			log.Printf("Pod %s compute Node %s LBScore Failed: %v", pod.Name, node.Name, err)
+		}
+		LBScoreMap[node.Name] = float64(nodeLBscore)
+		LBMin = math.Min(LBMin, nodeLBscore)
+		LBMax = math.Max(LBMax, nodeLBscore)
+
+		// 虽然还是检查过了，但是还是防止开启SLA的情况下，普通Pod触发ADF、FutureScore的计算
+		if neilats.config.EnableSLA && neiNodeExist && slaExist {
+			// 安全检查已经在PreFilter阶段通过了，不用检查了
+			SLAConstraintValue, _ := strconv.ParseFloat(slaConstraintValue, 64)
+			// 获取ADF分数
+			ADFScore, err := neilats.ADFScore(neiNodeValue, node.Name)
+			if err != nil {
+				log.Printf("Get ADFScore Failed, PodName:%s, NodeFrom:%s, NodeTo:%s.", pod.Name, neiNodeValue, node.Name)
+				ADFScore = 0
+			}
+			ADFScoreMap[node.Name] = ADFScore
+			ADFMin = math.Min(ADFMin, ADFScore)
+			ADFMax = math.Max(ADFMax, ADFScore)
+
+			// 获取未来网络延迟预测分数
+			FutureScore, err := neilats.FutureScore(neiNodeValue, node.Name, SLAConstraintValue)
+			if err != nil {
+				log.Printf("Get FutureScore Failed, PodName:%s, NodeFrom:%s, NodeTo:%s, SLAConstraint:%f.", pod.Name, neiNodeValue, node.Name, SLAConstraintValue)
+				FutureScore = 0
+			}
+			FutureScoreMap[node.Name] = FutureScore
+			FutureMin = math.Min(FutureMin, FutureScore)
+			FutureMax = math.Max(FutureMax, FutureScore)
+		}
 	}
-	return LBScore, nil
+
+	// 将三种类型的分数分别归一化, 如果某一种分数的值都一样，统一设置为100
+	for _, node := range nodes {
+		LBScore := LBScoreMap[node.Name]
+		if LBMax == LBMin {
+			LBScoreMap[node.Name] = 100
+		} else {
+			LBScoreMap[node.Name] = ((LBScore-LBMin)/(LBMax-LBMin) + 1) * 100
+		}
+
+		if neilats.config.EnableSLA && neiNodeExist && slaExist {
+			ADFScore := ADFScoreMap[node.Name]
+			if ADFMax == ADFMin {
+				ADFScoreMap[node.Name] = 100
+			} else {
+				ADFScoreMap[node.Name] = ((ADFScore-ADFMin)/(ADFMax-ADFMin) + 1) * 100
+			}
+
+			FutureScore := FutureScoreMap[node.Name]
+			if FutureMax == FutureMin {
+				FutureScoreMap[node.Name] = 100
+			} else {
+				FutureScoreMap[node.Name] = ((FutureScore-FutureMin)/(FutureMax-FutureMin) + 1) * 100
+			}
+		}
+	}
+	return framework.NewStatus(framework.Success, "LBScore、ADFScore、FutureScore Compute Complete.")
+}
+
+func (neilats *NeilatsRefactorScheduler) Score(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) (int64, *framework.Status) {
+	// 检查Pod是否存在邻近节点标签
+	_, neiNodeExist := p.GetLabels()["nei_node"]
+	// 检查Pod是否存在SLA约束要求标签
+	_, slaExist := p.GetLabels()["sla"]
+
+	var finalScore int64
+	if neilats.config.EnableSLA && neiNodeExist && slaExist {
+		// 归一化已经完成， 只需要求该节点各个分数的均方值
+		lbscore := LBScoreMap[nodeName]
+		adfscore := ADFScoreMap[nodeName]
+		futurescore := FutureScoreMap[nodeName]
+
+		finalScore = int64(math.Cbrt(lbscore * adfscore * futurescore))
+	} else {
+		finalScore = int64(LBScoreMap[nodeName])
+	}
+	log.Printf("Node %s Final Score before Normalized %d\n", nodeName, finalScore)
+	return finalScore, nil
 }
 
 // 计算节点的负载均衡得分
-func (neilats *NeilatsRefactorScheduler) LBScore(p *v1.Pod, nodeName string) (int64, error) {
+func (neilats *NeilatsRefactorScheduler) LBScore(p *v1.Pod, nodeName string) (float64, error) {
 	// 1. 计算Pod部署在节点上后，CPU的实际利用率
 	podCpuRequest := float64(0)
 	if p.Spec.Containers[0].Resources.Requests != nil {
@@ -382,10 +410,123 @@ func (neilats *NeilatsRefactorScheduler) LBScore(p *v1.Pod, nodeName string) (in
 	// 6. 计算四资源的方差
 	variance := math.Pow(realNodeCpuUseRate-avgScore, 2) + math.Pow(realNodeMemUseRate-avgScore, 2) + math.Pow(realNodeNetworkUseRate-avgScore, 2) + math.Pow(realNodeDiskUseRate-avgScore, 2)
 	// 7. 计算最终负载均衡得分
-	LBScore := int64(100 - 100*variance)
-	log.Printf("Node Name: %s LB Score: %d\n", nodeName, LBScore)
+	LBScore := float64(100 - 100*variance)
+	log.Printf("Node Name: %s LB Score: %f\n", nodeName, LBScore)
 
 	return LBScore, nil
+}
+
+func (neilats *NeilatsRefactorScheduler) ADFScore(nodeFrom, nodeTo string) (float64, error) {
+	nodeFromUASMap := neilats.config.KubeNodeAddressAndSecret[nodeFrom]
+	nodeToUASMap := neilats.config.KubeNodeAddressAndSecret[nodeTo]
+	// 获取两个节点之间的最后30行延迟数据，依据此得到ADF分数
+	lastNLatency, err := getLastLinesLatencyFromSSH(nodeFrom, nodeFromUASMap.NodeAddress, nodeFromUASMap.NodeSecret, nodeToUASMap.NodeAddress, 30)
+	if err != nil {
+		log.Printf("ADF Get Last N Lines Latency Failed, From Node %s To %s:%v\n", nodeFrom, nodeTo, err)
+		return 0, err
+	}
+	log.Printf("ADF Get Last N Lines Latency Success, From Node %s To %s\n", nodeFrom, nodeTo)
+	// 定义获取ADF分数的结构体
+	type ADFRequest struct {
+		Latency []float64 `json:"latency"`
+	}
+
+	// 创建请求体
+	reqBody := ADFRequest{
+		Latency: lastNLatency,
+	}
+	// 将请求体JSON化
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		log.Printf("Error ADF Marshaling JSON: %v\n", err)
+		return 0, err
+	}
+	// 利用ADF得分计算服务得到ADF得分
+	ADFScore, err := neilats.sendHTTPRequest(jsonData, "/adf_score")
+	if err != nil {
+		log.Printf("Error ADF Get ADFScore from RemoteServer: %v", err)
+		return 0, err
+	}
+	log.Printf("ADF Get ADFScore Success from RemoteServer, from Node %s To Node %s: %f", nodeFrom, nodeTo, ADFScore)
+	return ADFScore, nil
+}
+
+func (neilats *NeilatsRefactorScheduler) FutureScore(nodeFrom, nodeTo string, slaTime float64) (float64, error) {
+	nodeFromUASMap := neilats.config.KubeNodeAddressAndSecret[nodeFrom]
+	nodeToUASMap := neilats.config.KubeNodeAddressAndSecret[nodeTo]
+	lastNLatency, err := getLastLinesLatencyFromSSH(nodeFrom, nodeFromUASMap.NodeAddress, nodeFromUASMap.NodeSecret, nodeToUASMap.NodeAddress, 30)
+	if err != nil {
+		log.Printf("FutureScore Get Last N Lines Latency Failed, From Node %s To %s:%v", nodeFrom, nodeTo, err)
+		return 0, err
+	}
+	log.Printf("FutureScore Get Last N Lines Latency Success, From Node %s To %s\n", nodeFrom, nodeTo)
+	// 定义未来链路得分结构体
+	type FutureRequest struct {
+		Latency []float64 `json:"latency"`
+		SLATime float64   `json:"sla_time"`
+	}
+	// 创建请求体
+	reqBody := FutureRequest{
+		Latency: lastNLatency,
+		SLATime: slaTime,
+	}
+	// 将请求体JSON化
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		log.Printf("Error FutureScore Marshaling JSON: %v\n", err)
+		return 0, err
+	}
+	// 利用LSTM延迟预测和未来链路得分计算服务得到FutureScore
+	FutureScore, err := neilats.sendHTTPRequest(jsonData, "/predict/"+nodeFrom+"2"+nodeTo)
+	if err != nil {
+		log.Printf("Error Future Get FutureScore from RemoteServer: %v", err)
+		return 0, err
+	}
+	log.Printf("FutureScore Get Success from RemoteServer, from Node %s To Node %s: %f", nodeFrom, nodeTo, FutureScore)
+	return FutureScore, nil
+}
+
+func (neilats *NeilatsRefactorScheduler) sendHTTPRequest(reqBodyData []byte, serverAddress string) (float64, error) {
+	url := neilats.config.LstmAdfModuleAddress + serverAddress
+
+	// 创建请求
+	request, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBodyData))
+	if err != nil {
+		log.Printf("Error Creating requests: %v\n", err)
+		return 0, err
+	}
+
+	// 设置Header
+	request.Header.Set("Content-Type", "application/json")
+
+	// 发送请求
+	client := &http.Client{}
+	response, err := client.Do(request)
+	if err != nil {
+		log.Printf("Error Sending Request: %v\n", err)
+		return 0, err
+	}
+	defer response.Body.Close()
+
+	// 定义响应体结构体，用于接收数据
+	type ResponseType struct {
+		Score float64 `json:"score"`
+	}
+
+	// 读取响应体
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		log.Printf("Error Read Response Body: %v\n", err)
+	}
+	// 解析响应体
+	var result ResponseType
+	err = json.Unmarshal(body, &result)
+	if err != nil {
+		log.Printf("Error Failed to pares JSON: %v\n", err)
+		log.Printf("Raw response %s\n", string(body))
+		return 0, err
+	}
+	return result.Score, nil
 }
 
 func (neilats *NeilatsRefactorScheduler) ScoreExtensions() framework.ScoreExtensions {
@@ -417,7 +558,7 @@ func (neilats *NeilatsRefactorScheduler) NormalizeScore(ctx context.Context, sta
 			scores[i].Score = framework.MinNodeScore
 		} else {
 			scores[i].Score = ((nodeScore.Score - minScore) / oldRange * newRange) + framework.MinNodeScore
-			log.Printf("Node %s Normalized Score is %d", i, scores[i].Score)
+			log.Printf("Node %d Normalized Score is %d", i+1, scores[i].Score)
 		}
 	}
 	return nil
