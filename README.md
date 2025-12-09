@@ -4,9 +4,11 @@ tags:
   - scheudling-framework
 ---
 
-# Neilats_Refactor简介
+# Neilats代码与开发日志
 
-# 项目代码与开发日志
+> * GitHub项目链接
+>
+>   https://github.com/WyYong7240/neilats-refactor-scheduler-plugins
 
 ## 项目代码
 
@@ -1357,6 +1359,7 @@ func (f *fakeSharedLister) NodeInfos() framework.NodeInfoLister {
 * 由于如果要将在yaml中配置的参数传入自定义调度器的话，需要在调度器初始化阶段传入，即通过`func New(neilatsArgs runtime.Object, h framework.Handle) (framework.Plugin, error)`函数，所以需要使用传入的参数类型`runtime.Object`来初始化调度器配置，方式就是将`runtime.Object`类型转换为`NeilatsRefactorSchedulerArgs`类型
 
   这就有一个要求，即参数结构体需要实现`runtime.Object`类型的接口，并且还需要实现`DeepCopy`、`DeepCopyInto`（这两个方法也可以通过code-generator来生成）这两个接口，这是Kubernetes架构设计与代码生成工具的要求
+  使用Kubernetes代码生成器的方法，请见本文开发测试日志部分[[Neilats_Refactor的Scheduling-framework实现#修改4]]、[[Neilats_Refactor的Scheduling-framework实现#修改6]]
 
   除此以外，参数结构体中还要加上`metav1.TypeMeta`，这是Kubernetes库的要求
 
@@ -3193,3 +3196,720 @@ func (f *fakeSharedLister) NodeInfos() framework.NodeInfoLister {
   ~~~
 
   
+
+
+
+# Version2.0迭代
+
+> 之前的1.0版本，仅仅包含了LBScore的节点负载均衡得分计算，并不包含论文中的关于网络链路延迟的ADF平稳性得分计算、未来通信链路预测并计算未来通信链路得分的计算
+>
+> 因此，在2.0版本中添加后面的两个模块
+>
+> 由于网络链路ADF平稳性得分计算需要使用到Python的包、未来通信链路得分也需要使用LSTM对未来通信链路延迟值进行预测，并且考虑到在Neilats的Scheduling-framework中自己实现比较麻烦，且使得调度插件繁重，因此，最终决定后两个模块均使用Python实现，以Operator形式部署在集群中，通过提供Sevice的形式，为Neilats调度插件提供服务
+>
+> 关于后两个模块涉及到的部分，请查看如下文档
+>
+> 1. Obsidian文档
+>
+>    [[LSTM长短期记忆网络：用于时间序列预测]]
+>
+>    [[[将LSTM时间序列预测服务构建为应用+打包为Docker镜像运行]]
+>
+> 2. Github项目链接
+>
+>    https://github.com/WyYong7240/Neilats_LSTM_ADF_Module
+>
+>    https://github.com/WyYong7240/LSTMServerOperator
+
+## 代码变更
+
+### 1.自定义参数结构体
+
+修改`/apis/config/types.go`、`/apis/config/v1/types.go`、`/apis/config/v1beta3/types.go`
+
+新结构体
+
+~~~go
+type NeilatsRefactorSchedulerArgs struct {
+	// 如果自定义调度器有参数，需要参数结构体添加该内联类型，是Kubernetes库的要求
+	metav1.TypeMeta          `json:",inline"`
+	PrometheusAddress        string                          `json:"prometheusAddress"`
+	NetworkDevice            map[string]string               `json:"networkDevice"`
+	StorageDevice            map[string]string               `json:"storageDevice"`
+	EnableSLA                bool                            `json:"enableSLA"`
+	KubeNodeAddressAndSecret map[string]UserAddressSecretMap `json:"kubeNodeAddressAndSecret"`
+	LstmAdfModuleAddress     string                          `json:"lstmAdfModuleAddress"`
+}
+~~~
+
+增加了LSTM、ADF和未来得分计算模块的服务地址参数
+
+然后使用`./hack/update-codegen.sh`更新DeepCopy等实现
+
+### 2.自定义插件扩展点
+
+由于多了ADFScore、FutureScore两个得分，**论文中需要对这三个得分先进行节点间的归一化，然后再求三种得分的均方，作为节点的最终得分**
+
+但是，由于Schedule-Framework的Score扩展点的局限，**在Score扩展点中，只能访问到一个节点的信息，无法进行节点间的分数归一化**，因此，新增`PreScore`扩展点
+
+`PreScore`扩展点，**可以访问当前所有节点的信息，因此可以在Score扩展点之前预先计算好所有节点的三种分数，并且做好节点间的归一化操作**
+
+* PreScore扩展点实现
+
+  ~~~go
+  // 预先计算每个节点的三种得分
+  func (neilats *NeilatsRefactorScheduler) PreScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) *framework.Status {
+  	// 初始化各个节点不同得分Map
+  	nodeNum := len(nodes)
+  	LBScoreMap = make(map[string]float64, nodeNum)
+  	ADFScoreMap = make(map[string]float64, nodeNum)
+  	FutureScoreMap = make(map[string]float64, nodeNum)
+  
+  	// 找出各个分数值的极值，用于归一化
+  	var LBMax, ADFMax, FutureMax float64 = float64(math.MinInt64), float64(math.MinInt64), float64(math.MinInt64)
+  	var LBMin, ADFMin, FutureMin float64 = math.MaxFloat64, math.MaxFloat64, math.MaxFloat64
+  
+  	for _, node := range nodes {
+  		// 预先计算各个节点的负载均衡得分
+  		nodeLBscore, err := neilats.LBScore(pod, node.Name)
+  		if err != nil {
+  			log.Printf("Pod %s compute Node %s LBScore Failed: %v", pod.Name, node.Name, err)
+  		}
+  		LBScoreMap[node.Name] = float64(nodeLBscore)
+  		LBMin = math.Min(LBMin, nodeLBscore)
+  		LBMax = math.Max(LBMax, nodeLBscore)
+  
+  		if neilats.config.EnableSLA {
+  			// 安全检查已经在PreFilter阶段通过了，不用检查了
+  			neiNodeValue, _ := pod.GetLabels()["nei_node"]
+  			SLAConstraintValue, _ := strconv.ParseFloat(pod.GetLabels()["sla"], 64)
+  			// 获取ADF分数
+  			ADFScore, err := neilats.ADFScore(neiNodeValue, node.Name)
+  			if err != nil {
+  				log.Printf("Get ADFScore Failed, PodName:%s, NodeFrom:%s, NodeTo:%s.", pod.Name, neiNodeValue, node.Name)
+  				ADFScore = 0
+  			}
+  			ADFScoreMap[node.Name] = ADFScore
+  			ADFMin = math.Min(ADFMin, ADFScore)
+  			ADFMax = math.Max(ADFMax, ADFScore)
+  
+  			// 获取未来网络延迟预测分数
+  			FutureScore, err := neilats.FutureScore(neiNodeValue, node.Name, SLAConstraintValue)
+  			if err != nil {
+  				log.Printf("Get FutureScore Failed, PodName:%s, NodeFrom:%s, NodeTo:%s, SLAConstraint:%f.", pod.Name, neiNodeValue, node.Name, SLAConstraintValue)
+  				FutureScore = 0
+  			}
+  			FutureScoreMap[node.Name] = FutureScore
+  			FutureMin = math.Min(FutureMin, FutureScore)
+  			FutureMax = math.Max(FutureMax, FutureScore)
+  		}
+  	}
+  
+  	// 将三种类型的分数分别归一化, 如果某一种分数的值都一样，统一设置为100
+  	for _, node := range nodes {
+  		LBScore := LBScoreMap[node.Name]
+  		if LBMax == LBMin {
+  			LBScoreMap[node.Name] = 100
+  		} else {
+  			LBScoreMap[node.Name] = ((LBScore-LBMin)/(LBMax-LBMin) + 1) * 100
+  		}
+  
+  		if neilats.config.EnableSLA {
+  			ADFScore := ADFScoreMap[node.Name]
+  			if ADFMax == ADFMin {
+  				ADFScoreMap[node.Name] = 100
+  			} else {
+  				ADFScoreMap[node.Name] = ((ADFScore-ADFMin)/(ADFMax-ADFMin) + 1) * 100
+  			}
+  
+  			FutureScore := FutureScoreMap[node.Name]
+  			if FutureMax == FutureMin {
+  				FutureScoreMap[node.Name] = 100
+  			} else {
+  				FutureScoreMap[node.Name] = ((FutureScore-FutureMin)/(FutureMax-FutureMin) + 1) * 100
+  			}
+  		}
+  	}
+  	return framework.NewStatus(framework.Success, "LBScore、ADFScore、FutureScore Compute Complete.")
+  }
+  ~~~
+
+* LBScore负载均衡度得分计算，未改变
+
+* ADFScore网络稳定性得分计算
+
+  ~~~go
+  func (neilats *NeilatsRefactorScheduler) ADFScore(nodeFrom, nodeTo string) (float64, error) {
+  	nodeFromUASMap := neilats.config.KubeNodeAddressAndSecret[nodeFrom]
+  	nodeToUASMap := neilats.config.KubeNodeAddressAndSecret[nodeTo]
+  	// 获取两个节点之间的最后30行延迟数据，依据此得到ADF分数
+  	lastNLatency, err := getLastLinesLatencyFromSSH(nodeFrom, nodeFromUASMap.NodeAddress, nodeFromUASMap.NodeSecret, nodeToUASMap.NodeAddress, 30)
+  	if err != nil {
+  		log.Printf("ADF Get Last N Lines Latency Failed, From Node %s To %s:%v", nodeFrom, nodeTo, err)
+  		return 0, err
+  	}
+  	// 定义获取ADF分数的结构体
+  	type ADFRequest struct {
+  		Latency []float64 `json:"latency"`
+  	}
+  
+  	reqBody := ADFRequest{
+  		Latency: lastNLatency,
+  	}
+  	jsonData, err := json.Marshal(reqBody)
+  	if err != nil {
+  		log.Printf("Error ADF Marshaling JSON: %v\n", err)
+  		return 0, err
+  	}
+  	ADFScore, err := neilats.sendHTTPRequest(jsonData, "/adf_score")
+  	if err != nil {
+  		log.Printf("Error ADF Get ADFScore from RemoteServer: %v", err)
+  		return 0, err
+  	}
+  	return ADFScore, nil
+  }
+  ~~~
+
+* FutureScore未来链路得分计算
+
+  ~~~go
+  func (neilats *NeilatsRefactorScheduler) FutureScore(nodeFrom, nodeTo string, slaTime float64) (float64, error) {
+  	nodeFromUASMap := neilats.config.KubeNodeAddressAndSecret[nodeFrom]
+  	nodeToUASMap := neilats.config.KubeNodeAddressAndSecret[nodeTo]
+  	lastNLatency, err := getLastLinesLatencyFromSSH(nodeFrom, nodeFromUASMap.NodeAddress, nodeFromUASMap.NodeSecret, nodeToUASMap.NodeAddress, 30)
+  	if err != nil {
+  		log.Printf("ADF Get Last N Lines Latency Failed, From Node %s To %s:%v", nodeFrom, nodeTo, err)
+  		return 0, err
+  	}
+  	// 定义未来链路得分结构体
+  	type FutureRequest struct {
+  		Latency []float64 `json:"latency"`
+  		SLATime float64   `json:"sla_time"`
+  	}
+  	// 创建请求体
+  	reqBody := FutureRequest{
+  		Latency: lastNLatency,
+  		SLATime: slaTime,
+  	}
+  	// 将请求体JSON化
+  	jsonData, err := json.Marshal(reqBody)
+  	if err != nil {
+  		log.Printf("Error FutureScore Marshaling JSON: %v\n", err)
+  		return 0, err
+  	}
+  	// 利用LSTM延迟预测和未来链路得分计算服务得到FutureScore
+  	FutureScore, err := neilats.sendHTTPRequest(jsonData, "/predict/"+nodeFrom+"2"+nodeTo)
+  	if err != nil {
+  		log.Printf("Error Future Get FutureScore from RemoteServer: %v", err)
+  		return 0, err
+  	}
+  	return FutureScore, nil
+  }
+  ~~~
+
+* 对Neilats_LSTM_ADF_Module模块进行HTTP访问
+
+  ~~~go
+  func (neilats *NeilatsRefactorScheduler) sendHTTPRequest(reqBodyData []byte, serverAddress string) (float64, error) {
+  	url := neilats.config.LstmAdfModuleAddress + serverAddress
+  
+  	// 创建请求
+  	request, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBodyData))
+  	if err != nil {
+  		log.Printf("Error Creating requests: %v\n", err)
+  		return 0, err
+  	}
+  
+  	// 设置Header
+  	request.Header.Set("Content-Type", "application/json")
+  
+  	// 发送请求
+  	client := &http.Client{}
+  	response, err := client.Do(request)
+  	if err != nil {
+  		log.Printf("Error Sending Request: %v\n", err)
+  		return 0, err
+  	}
+  	defer response.Body.Close()
+  
+  	// 定义响应体结构体，用于接收数据
+  	type ResponseType struct {
+  		Score float64
+  	}
+  
+  	// 读取响应体
+  	body, err := io.ReadAll(response.Body)
+  	if err != nil {
+  		log.Printf("Error Read Response Body: %v\n", err)
+  	}
+  	// 解析响应体
+  	var result ResponseType
+  	err = json.Unmarshal(body, &result)
+  	if err != nil {
+  		log.Printf("Error Failed to pares JSON: %v\n", err)
+  		log.Printf("Raw response %s\n", string(body))
+  		return 0, err
+  	}
+  	return result.Score, nil
+  }
+  ~~~
+
+* 变更之后的Score扩展点
+
+  ~~~go
+  func (neilats *NeilatsRefactorScheduler) Score(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) (int64, *framework.Status) {
+  	if neilats.config.EnableSLA {
+  		// 归一化已经完成， 只需要求该节点各个分数的均方值
+  		lbscore := LBScoreMap[nodeName]
+  		adfscore := ADFScoreMap[nodeName]
+  		futurescore := FutureScoreMap[nodeName]
+  		return int64(math.Cbrt(lbscore * adfscore * futurescore)), nil
+  	} else {
+  		return int64(LBScoreMap[nodeName]), nil
+  	}
+  }
+  ~~~
+
+### 3.工具函数getLastLinesLatencyFromSSH
+
+原本的getMeanOfLatencyFromSSH工具函数被拆为两个工具函数
+
+1. getMeanOfLatencyFromSSH
+
+   ~~~go
+   func getMeanOfLatencyFromSSH(nodeFromName, nodeFromAddress, nodeFromSecret, nodeToAddress string) (float64, error) {
+   	lastNLatency, err := getLastLinesLatencyFromSSH(nodeFromName, nodeFromAddress, nodeFromSecret, nodeToAddress, 30)
+   	if err != nil {
+   		log.Printf("Get last N Lines Latency Data Failed:%v\n", err)
+   	}
+   
+   	var latencySum float64 = 0
+   	for _, line := range lastNLatency {
+   		latencySum += line
+   	}
+   
+   	// 返回延迟平均值
+   	return latencySum / float64(len(lastNLatency)), nil
+   }
+   ~~~
+
+2. getLastLinesLatencyFromSSH
+
+   ~~~go
+   func getLastLinesLatencyFromSSH(nodeFromName, nodeFromAddress, nodeFromSecret, nodeToAddress string, lastNLines int) ([]float64, error) {
+   	resultFilePath := fmt.Sprintf("/root/ws/network-latency-test/latency_results_%s.txt", nodeToAddress)
+   
+   	// 连接到远程服务器
+   	client, err := getSshClient(nodeFromName, nodeFromAddress, nodeFromSecret)
+   	if err != nil {
+   		log.Printf("failed to login Node %q: %v\n", nodeFromName, err)
+   		return nil, err
+   	}
+   	defer client.Close()
+   
+   	// 创建SFTP客户端
+   	sftpClient, err := sftp.NewClient(client)
+   	if err != nil {
+   		log.Printf("after Login Node %q, Failed Create Sftp Client: %v\n", nodeFromName, err)
+   		return nil, err
+   	}
+   	defer sftpClient.Close()
+   
+   	// 打开远程主机上的文件
+   	resultFile, err := sftpClient.Open(resultFilePath)
+   	if err != nil {
+   		log.Printf("after Create Sftp Client on Node %q, Failed Open remoteFile:%v\n", nodeFromName, err)
+   		return nil, err
+   	}
+   	defer resultFile.Close()
+   
+   	// 保存每行数据字符串
+   	var lines []string
+   	scanner := bufio.NewScanner(resultFile)
+   	for scanner.Scan() {
+   		lines = append(lines, scanner.Text())
+   		if len(lines) > lastNLines {
+   			// 仅保留最后lastN行数据，代码含义为切片从下标为1的元素开始到最后一个元素作为一个新切片
+   			lines = lines[1:]
+   		}
+   	}
+   	if err := scanner.Err(); err != nil {
+   		log.Printf("get Last N Lines in ResultFile Failed:%v\n", err)
+   		return nil, err
+   	}
+   
+   	// 保存最后N行的延迟数据值
+   	var lastNLatency []float64
+   
+   	for _, line := range lines {
+   		splitedLine := strings.Split(line, " ")
+   		dataStr := splitedLine[len(splitedLine)-2]
+   		dataStr, _ = strings.CutPrefix(dataStr, "(")
+   		latencyData, err := strconv.ParseFloat(dataStr, 64)
+   		if err != nil {
+   			log.Printf("convert Data String to Float Failed:%v\n", err)
+   			return nil, err
+   		}
+   		lastNLatency = append(lastNLatency, latencyData)
+   	}
+   	// 返回最后N行的延迟值
+   	return lastNLatency, nil
+   }
+   ~~~
+
+
+
+
+
+
+## 测试与修改
+
+## 25.12.8
+
+### 修改1：NeiNode==CurrentNode问题、Pod标签无法识别问题、日志信息增加
+
+> 1. 当Pod的`nei_node`、`sla`标签写错位置，例如写在Deployment下时，又同时开启SLA了，就会出现
+>
+>    ~~~
+>    I1208 03:32:57.108501       1 log.go:245] failed to login Node "": dial tcp :22: connect: connection refused
+>    I1208 03:32:57.108509       1 log.go:245] failed to login Node "": dial tcp :22: connect: connection refused
+>    I1208 03:32:57.108514       1 log.go:245] ADF Get Last N Lines Latency Failed, From Node  To node1:dial tcp :22: connect: connection refused
+>    I1208 03:32:57.108519       1 log.go:245] Get ADFScore Failed, PodName:nginx-deployment-test-neilats-f7b7fdcfb-znvqk, NodeFrom:, NodeTo:node1.
+>    I1208 03:32:57.108565       1 log.go:245] failed to login Node "": dial tcp :22: connect: connection refused
+>    I1208 03:32:57.108573       1 log.go:245] failed to login Node "": dial tcp :22: connect: connection refused
+>    I1208 03:32:57.108581       1 log.go:245] ADF Get Last N Lines Latency Failed, From Node  To node1:dial tcp :22: connect: connection refused
+>    I1208 03:32:57.108586       1 log.go:245] Get FutureScore Failed, PodName:nginx-deployment-test-neilats-f7b7fdcfb-znvqk, NodeFrom:, NodeTo:node1, SLAConstraint:0.000000.
+>    I1208 03:32:57.108687       1 log.go:245] Node %!s(int=0) Normalized Score is 0
+>    I1208 03:32:57.108695       1 log.go:245] Node %!s(int=1) Normalized Score is 100
+>    I1208 03:32:57.108698       1 log.go:245] Node %!s(int=2) Normalized Score is 0
+>    I1208 03:32:57.108817       1 log.go:245] Pod nginx-deployment-test-neilats-f7b7fdcfb-wzq75 haven't NeiNodeLable And SLAConstraintLable, pass Prefilter
+>    ~~~
+>
+> 2. 当Pod的邻近节点是当前的测试节点，即FromNode和ToNode相同时，处理出错，会找不到延迟文件
+>
+> 3. ADF、FutureScore两个得分建议增加相关日志信息；对最终多个节点在NormalizationScore日志进行优化
+
+* 针对问题1，做出如下代码修改
+
+  在`PreScore`扩展点中，关于计算ADF、FutureScore的地方，增加if语句条件
+
+  ~~~go
+  		// 虽然还是检查过了，但是还是防止开启SLA的情况下，普通Pod触发ADF、FutureScore的计算
+  		if neilats.config.EnableSLA && neiNodeExist && slaExist {
+  			// 安全检查已经在PreFilter阶段通过了，不用检查了
+  			SLAConstraintValue, _ := strconv.ParseFloat(slaConstraintValue, 64)
+  			// 获取ADF分数
+  			ADFScore, err := neilats.ADFScore(neiNodeValue, node.Name)
+              .......
+              
+          	// 将三种类型的分数分别归一化, 如果某一种分数的值都一样，统一设置为100
+  	for _, node := range nodes {
+  		LBScore := LBScoreMap[node.Name]
+  		if LBMax == LBMin {
+  			LBScoreMap[node.Name] = 100
+  		} else {
+  			LBScoreMap[node.Name] = ((LBScore-LBMin)/(LBMax-LBMin) + 1) * 100
+  		}
+  
+  		if neilats.config.EnableSLA && neiNodeExist && slaExist {
+  			ADFScore := ADFScoreMap[node.Name]
+  			if ADFMax == ADFMin {
+  				ADFScoreMap[node.Name] = 100
+  			} else {
+  ~~~
+
+  在Score扩展点中，对开启SLA的情况增加if条件
+
+  ~~~go
+  	// 检查Pod是否存在邻近节点标签
+  	_, neiNodeExist := p.GetLabels()["nei_node"]
+  	// 检查Pod是否存在SLA约束要求标签
+  	_, slaExist := p.GetLabels()["sla"]
+  
+  	var finalScore int64
+  	if neilats.config.EnableSLA && neiNodeExist && slaExist {
+  		// 归一化已经完成， 只需要求该节点各个分数的均方值
+  		lbscore := LBScoreMap[nodeName]
+  		adfscore := ADFScoreMap[nodeName]
+  		futurescore := FutureScoreMap[nodeName]
+  
+  		finalScore = int64(math.Cbrt(lbscore * adfscore * futurescore))
+  ~~~
+
+* 针对问题2，修改`Filter`扩展点，设计将邻近节点作为不可调度节点
+
+  ~~~go
+  		// 如果邻近节点与当前节点一致，不予通过，即Pod不可调度到邻近节点上
+  		if neiNodeValue == nodeInfo.Node().Name {
+  			log.Printf("Pod Nei_Node %s is Same As Current Node!", neiNodeValue)
+  			return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("Failed Build RttMatrix:%v", err))
+  		}
+  ~~~
+
+* 针对问题3，修改ADFScore、FutureScore，增加日志输出信息语句
+
+  ~~~go
+  	log.Printf("ADF Get Last N Lines Latency Success, From Node %s To %s\n", nodeFrom, nodeTo)
+  	log.Printf("ADF Get ADFScore Success from RemoteServer, from Node %s To Node %s: %f", nodeFrom, nodeTo, ADFScore)
+  
+  	log.Printf("FutureScore Get Last N Lines Latency Success, From Node %s To %s\n", nodeFrom, nodeTo)
+  	log.Printf("FutureScore Get Success from RemoteServer, from Node %s To Node %s: %f", nodeFrom, nodeTo, FutureScore)
+  ~~~
+
+### 修改2：ADF和FutureScore得分解析问题、FutureScore访问端口错乱问题
+
+> 1. 当服务访问正常后，LSTM_ADF_Module返回的信息解析出现得分为0的情况，即ADF、FutureScore解析错误
+>
+>    ~~~sh
+>    I1208 08:42:39.882356       1 log.go:245] ADF Get Last N Lines Latency Success, From Node node1 To node2
+>    I1208 08:42:39.920462       1 log.go:245] ADF Get ADFScore Success from RemoteServer, from Node node1 To Node node2: 0.000000
+>    I1208 08:42:40.057018       1 log.go:245] FutureScore Get Last N Lines Latency Success, From Node node1 To node2
+>    I1208 08:42:40.112988       1 log.go:245] FutureScore Get Success from RemoteServer, from Node node1 To Node node2: 0.00000
+>    ~~~
+>
+> 2. 有时候访问FutureScore端口会错误，因为从master到node1，不止有master2node1，还会使node12master
+>
+>    ~~~shell
+>    I1208 08:42:39.728834       1 log.go:245] Get FutureScore Failed, PodName:nginx-deployment-test-neilats-586b9b9ccf-rwt2r, NodeFrom:node1, NodeTo:master, SLAConstraint:0.300000.
+>    ~~~
+
+* 针对问题1，首先将调度插件中，对返回体的定义增加json解析字段；其次，将LSTM_ADF_Module的返回字段统一设置为`score`
+
+  解析错误是因为，调度插件中的返回体定义没增加json解析字段，并且返回体成员变量名与服务返回体中的字段名不一致，导致解析错误
+
+  为了让同一类型的返回体能同时接收adf_score和future_score，因此将LSTM_ADF_Module返回体字段统一设置为`score`
+
+  1. 调度插件`sendHTTPRequest`修改
+
+     ~~~go
+     	// 定义响应体结构体，用于接收数据
+     	type ResponseType struct {
+     		Score float64 `json:"score"`
+     	}
+     ~~~
+
+  2. `LSTM_ADF_Module:predict_flask_app.py`修改
+
+     ~~~python
+             # 计算未来通信链路得分
+             print(model_scaler_name + " predict latency:")
+             print(pred_inv.tolist())
+             future_score = def_future_score(pred_inv.tolist(), sla_time)
+             print(model_scaler_name + " future_score:")
+             print(future_score)
+             return jsonify({"score": future_score})
+         
+     	# 计算稳定性得分
+         print(data["latency"])
+         adf_score = adf(data["latency"])
+         print("adf_score:")
+         print(adf_score)
+         return jsonify({"score": adf_score})
+     ~~~
+
+     具体见：
+
+* 针对问题2，将LSTM_ADF_Module访问端口统一为一个模式
+
+  修改`LSTM_ADF_Module:predict_flask_app.py`
+
+  ~~~python
+  @app.route("/predict/<path:pattern>", methods=["POST"])
+  def predict_master2node1(pattern):
+      model_scaler_name = ""
+      if pattern in ["master2node1", "node12master"]:
+          model_scaler_name = "master2node1"
+      elif pattern in ["master2node2", "node22master"]:
+          model_scaler_name = "master2node2"
+      elif pattern in ["master2node3", "node32master"]:
+          model_scaler_name = "master2node3"
+      elif pattern in ["node12node2", "node22node1"]:
+          model_scaler_name = "node12node2"
+      elif pattern in ["node12node3", "node32node1"]:
+          model_scaler_name = "node12node3"
+      elif pattern in ["node22node3", "node32node2"]:
+          model_scaler_name = "node22node3"
+      try:
+          # 获取数据
+          input_tensor, sla_time = get_input_tensor(model_scaler_name)
+          # 推理
+          with torch.no_grad():
+              pred_scaled = MODELS[model_scaler_name](input_tensor)
+              pred_scaled = pred_scaled.cpu().numpy()
+          # 反归一化
+          pred_inv = SCALERS[model_scaler_name].inverse_transform(pred_scaled.reshape(-1, 1))
+  
+          # 计算未来通信链路得分
+          print(model_scaler_name + " predict latency:")
+          print(pred_inv.tolist())
+          future_score = def_future_score(pred_inv.tolist(), sla_time)
+          print(model_scaler_name + " future_score:")
+          print(future_score)
+          return jsonify({"score": future_score})
+  
+          # return jsonify({"prediction": pred_inv.tolist()})
+      except Exception as e:
+          return jsonify({"error":str(e)}), 500
+  ~~~
+
+  具体见：
+
+### Version2调度成功
+
+~~~sh
+(base) root@master:~/work/SchedulingFramework# kubectl logs neilats-refactor-scheduler-7b4f7bc5bb-cq7t7 -n k8s-learn
+I1209 03:31:34.223607       1 serving.go:348] Generated self-signed cert in-memory
+W1209 03:31:34.224313       1 client_config.go:618] Neither --kubeconfig nor --master was specified.  Using the inClusterConfig.  This might not work.
+I1209 03:31:34.447581       1 log.go:245] Custom Neilats Args Detected!
+I1209 03:31:34.447596       1 log.go:245] Config EnableSLA is True!
+I1209 03:31:34.447605       1 log.go:245] Init Node "master" Latency Test Tool
+I1209 03:31:35.053211       1 log.go:245] Command executed successfully
+I1209 03:31:35.053321       1 log.go:245] Install Latency Test Tool Success
+I1209 03:31:35.175329       1 log.go:245] Command executed successfully
+I1209 03:31:35.175381       1 log.go:245] Node "master" Create Latency Test Directory Success
+I1209 03:31:35.304325       1 log.go:245] Init Node "node1" Latency Test Tool
+I1209 03:31:35.950964       1 log.go:245] Command executed successfully
+I1209 03:31:35.951015       1 log.go:245] Install Latency Test Tool Success
+I1209 03:31:36.075532       1 log.go:245] Command executed successfully
+I1209 03:31:36.075584       1 log.go:245] Node "node1" Create Latency Test Directory Success
+I1209 03:31:36.202473       1 log.go:245] Init Node "node2" Latency Test Tool
+I1209 03:31:36.856950       1 log.go:245] Command executed successfully
+I1209 03:31:36.857002       1 log.go:245] Install Latency Test Tool Success
+I1209 03:31:36.985870       1 log.go:245] Command executed successfully
+I1209 03:31:36.985918       1 log.go:245] Node "node2" Create Latency Test Directory Success
+I1209 03:31:37.108609       1 log.go:245] Init Node "node3" Latency Test Tool
+I1209 03:31:37.755220       1 log.go:245] Command executed successfully
+I1209 03:31:37.755260       1 log.go:245] Install Latency Test Tool Success
+I1209 03:31:37.883433       1 log.go:245] Command executed successfully
+I1209 03:31:37.883494       1 log.go:245] Node "node3" Create Latency Test Directory Success
+I1209 03:31:38.022859       1 log.go:245] Init Node Latency Test Tool Success!
+I1209 03:31:38.156646       1 log.go:245] Command executed successfully
+I1209 03:31:38.156692       1 log.go:245] Success Start Node "master" Latency Test!
+I1209 03:31:38.278145       1 log.go:245] Command executed successfully
+I1209 03:31:38.278193       1 log.go:245] Success Start Node "node1" Latency Test!
+I1209 03:31:38.401019       1 log.go:245] Command executed successfully
+I1209 03:31:38.401072       1 log.go:245] Success Start Node "node2" Latency Test!
+I1209 03:31:38.530669       1 log.go:245] Command executed successfully
+I1209 03:31:38.530717       1 log.go:245] Success Start Node "node3" Latency Test!
+I1209 03:31:38.530728       1 log.go:245] Start Latency Test Success!
+I1209 03:31:38.530733       1 log.go:245] Final Neilats Config is:
+I1209 03:31:38.530773       1 log.go:245] {{ } http://192.168.3.226:31739 map[master:ens18 node1:ens18 node2:ens18 node3:ens18] map[master:/dev/mapper/ubuntu--vg-ubuntu--lv node1:/dev/mapper/ubuntu--vg-ubuntu--lv node2:/dev/mapper/ubuntu--vg-ubuntu--lv node3:/dev/mapper/ubuntu--vg-ubuntu--lv] true map[master:{192.168.3.226 mobisys912} node1:{192.168.3.229 mobisys912} node2:{192.168.3.224 mobisys912} node3:{192.168.3.228 mobisys912}] http://192.168.3.212:30080}
+I1209 03:31:38.536033       1 capacity_scheduling.go:190] "CapacityScheduling start"
+I1209 03:31:38.536530       1 server.go:154] "Starting Kubernetes Scheduler" version="v0.0.20251208"
+I1209 03:31:38.536544       1 server.go:156] "Golang settings" GOGC="" GOMAXPROCS="" GOTRACEBACK=""
+I1209 03:31:38.539693       1 configmap_cafile_content.go:202] "Starting controller" name="client-ca::kube-system::extension-apiserver-authentication::requestheader-client-ca-file"
+I1209 03:31:38.539684       1 configmap_cafile_content.go:202] "Starting controller" name="client-ca::kube-system::extension-apiserver-authentication::client-ca-file"
+I1209 03:31:38.539749       1 shared_informer.go:311] Waiting for caches to sync for client-ca::kube-system::extension-apiserver-authentication::requestheader-client-ca-file
+I1209 03:31:38.539761       1 requestheader_controller.go:169] Starting RequestHeaderAuthRequestController
+I1209 03:31:38.539775       1 shared_informer.go:311] Waiting for caches to sync for RequestHeaderAuthRequestController
+I1209 03:31:38.539750       1 shared_informer.go:311] Waiting for caches to sync for client-ca::kube-system::extension-apiserver-authentication::client-ca-file
+I1209 03:31:38.539876       1 secure_serving.go:213] Serving securely on [::]:10259
+I1209 03:31:38.539923       1 tlsconfig.go:240] "Starting DynamicServingCertificateController"
+I1209 03:31:38.640604       1 shared_informer.go:318] Caches are synced for RequestHeaderAuthRequestController
+I1209 03:31:38.640665       1 shared_informer.go:318] Caches are synced for client-ca::kube-system::extension-apiserver-authentication::requestheader-client-ca-file
+I1209 03:31:38.640678       1 shared_informer.go:318] Caches are synced for client-ca::kube-system::extension-apiserver-authentication::client-ca-file
+I1209 03:34:13.209378       1 log.go:245] Pod nginx-deployment-test-neilats-586b9b9ccf-q2zvq NeiNodeLable node1 And SLAConstraintLabel "0.3", pass Prefilter
+I1209 03:34:13.209471       1 log.go:245] Pod Nei_Node node1 is Same As Current Node!
+I1209 03:34:15.656366       1 log.go:245] Node node2 rtt Satisfy Pod nginx-deployment-test-neilats-586b9b9ccf-q2zvq SLA Constraint
+I1209 03:34:15.680792       1 log.go:245] Node node3 rtt Satisfy Pod nginx-deployment-test-neilats-586b9b9ccf-q2zvq SLA Constraint
+I1209 03:34:15.846183       1 log.go:245] Node master rtt Satisfy Pod nginx-deployment-test-neilats-586b9b9ccf-q2zvq SLA Constraint
+I1209 03:34:15.848119       1 log.go:245] Total CPU of node: node2 is 8000.000000
+I1209 03:34:15.849331       1 log.go:245] CPU idle rate of node: node2 is 0.988549
+I1209 03:34:15.850032       1 log.go:245] Total memory of node: node2 is 15991.878906 MB
+I1209 03:34:15.850598       1 log.go:245] Memory available of node: node2 is 0.851887
+I1209 03:34:15.851699       1 log.go:245] Network available of node: node2 is 3.842759
+I1209 03:34:15.852249       1 log.go:245] Total disk of node: node2 is 78306.820312 MB
+I1209 03:34:15.852962       1 log.go:245] Disk available of node: node2 is 54.236790
+I1209 03:34:15.852970       1 log.go:245] Node Name: node2 LB Score: -205949.796068
+I1209 03:34:16.029373       1 log.go:245] ADF Get Last N Lines Latency Success, From Node node1 To node2
+I1209 03:34:16.252353       1 log.go:245] ADF Get ADFScore Success from RemoteServer, from Node node1 To Node node2: 0.000000
+I1209 03:34:16.451452       1 log.go:245] FutureScore Get Last N Lines Latency Success, From Node node1 To node2
+I1209 03:34:16.661850       1 log.go:245] FutureScore Get Success from RemoteServer, from Node node1 To Node node2: -4.913113
+I1209 03:34:16.662937       1 log.go:245] Total CPU of node: node3 is 8000.000000
+I1209 03:34:16.663989       1 log.go:245] CPU idle rate of node: node3 is 0.994408
+I1209 03:34:16.664672       1 log.go:245] Total memory of node: node3 is 15991.820312 MB
+I1209 03:34:16.665335       1 log.go:245] Memory available of node: node3 is 0.939870
+I1209 03:34:16.666431       1 log.go:245] Network available of node: node3 is 3.859632
+I1209 03:34:16.666926       1 log.go:245] Total disk of node: node3 is 78306.820312 MB
+I1209 03:34:16.667503       1 log.go:245] Disk available of node: node3 is 52.942462
+I1209 03:34:16.667511       1 log.go:245] Node Name: node3 LB Score: -195618.290413
+I1209 03:34:16.843504       1 log.go:245] ADF Get Last N Lines Latency Success, From Node node1 To node3
+I1209 03:34:16.862384       1 log.go:245] ADF Get ADFScore Success from RemoteServer, from Node node1 To Node node3: 9.533285
+I1209 03:34:17.048354       1 log.go:245] FutureScore Get Last N Lines Latency Success, From Node node1 To node3
+I1209 03:34:17.101764       1 log.go:245] FutureScore Get Success from RemoteServer, from Node node1 To Node node3: -4.923121
+I1209 03:34:17.102699       1 log.go:245] Total CPU of node: master is 8000.000000
+I1209 03:34:17.103638       1 log.go:245] CPU idle rate of node: master is 0.965129
+I1209 03:34:17.104428       1 log.go:245] Total memory of node: master is 15991.886719 MB
+I1209 03:34:17.105074       1 log.go:245] Memory available of node: master is 0.698509
+I1209 03:34:17.106392       1 log.go:245] Network available of node: master is 3.842724
+I1209 03:34:17.107088       1 log.go:245] Total disk of node: master is 78306.820312 MB
+I1209 03:34:17.107855       1 log.go:245] Disk available of node: master is 20.877731
+I1209 03:34:17.107864       1 log.go:245] Node Name: master LB Score: -27703.548345
+I1209 03:34:17.292575       1 log.go:245] ADF Get Last N Lines Latency Success, From Node node1 To master
+I1209 03:34:17.306574       1 log.go:245] ADF Get ADFScore Success from RemoteServer, from Node node1 To Node master: 0.000000
+I1209 03:34:17.492224       1 log.go:245] FutureScore Get Last N Lines Latency Success, From Node node1 To master
+I1209 03:34:17.548984       1 log.go:245] FutureScore Get Success from RemoteServer, from Node node1 To Node master: -4.295151
+I1209 03:34:17.549089       1 log.go:245] Node node2 Final Score before Normalized 100
+I1209 03:34:17.549100       1 log.go:245] Node master Final Score before Normalized 158
+I1209 03:34:17.549120       1 log.go:245] Node node3 Final Score before Normalized 128
+I1209 03:34:17.549161       1 log.go:245] Node 1 Normalized Score is 0
+I1209 03:34:17.549168       1 log.go:245] Node 2 Normalized Score is 0
+I1209 03:34:17.549172       1 log.go:245] Node 3 Normalized Score is 100
+I1209 03:34:17.549382       1 trace.go:236] Trace[550718497]: "Scheduling" namespace:k8s-learn,name:nginx-deployment-test-neilats-586b9b9ccf-q2zvq (09-Dec-2025 03:34:13.209) (total time: 4340ms):
+Trace[550718497]: ---"Computing predicates done" 2636ms (03:34:15.846)
+Trace[550718497]: ---"Prioritizing done" 1703ms (03:34:17.549)
+Trace[550718497]: [4.340047949s] [4.340047949s] END
+I1209 03:34:17.549586       1 log.go:245] Pod nginx-deployment-test-neilats-586b9b9ccf-gfcpl NeiNodeLable node1 And SLAConstraintLabel "0.3", pass Prefilter
+I1209 03:34:17.549973       1 log.go:245] Pod Nei_Node node1 is Same As Current Node!
+I1209 03:34:19.832455       1 log.go:245] Node node2 rtt Satisfy Pod nginx-deployment-test-neilats-586b9b9ccf-gfcpl SLA Constraint
+I1209 03:34:19.833681       1 log.go:245] Node master rtt Satisfy Pod nginx-deployment-test-neilats-586b9b9ccf-gfcpl SLA Constraint
+I1209 03:34:19.833713       1 log.go:245] Node node3 rtt Satisfy Pod nginx-deployment-test-neilats-586b9b9ccf-gfcpl SLA Constraint
+I1209 03:34:19.835071       1 log.go:245] Total CPU of node: node2 is 8000.000000
+I1209 03:34:19.836099       1 log.go:245] CPU idle rate of node: node2 is 0.988549
+I1209 03:34:19.836846       1 log.go:245] Total memory of node: node2 is 15991.878906 MB
+I1209 03:34:19.837619       1 log.go:245] Memory available of node: node2 is 0.851887
+I1209 03:34:19.839092       1 log.go:245] Network available of node: node2 is 3.842759
+I1209 03:34:19.839546       1 log.go:245] Total disk of node: node2 is 78306.820312 MB
+I1209 03:34:19.840349       1 log.go:245] Disk available of node: node2 is 54.236790
+I1209 03:34:19.840356       1 log.go:245] Node Name: node2 LB Score: -205949.796068
+I1209 03:34:20.022470       1 log.go:245] ADF Get Last N Lines Latency Success, From Node node1 To node2
+I1209 03:34:20.043228       1 log.go:245] ADF Get ADFScore Success from RemoteServer, from Node node1 To Node node2: 3.221916
+I1209 03:34:20.228560       1 log.go:245] FutureScore Get Last N Lines Latency Success, From Node node1 To node2
+I1209 03:34:20.298119       1 log.go:245] FutureScore Get Success from RemoteServer, from Node node1 To Node node2: -4.914557
+I1209 03:34:20.299151       1 log.go:245] Total CPU of node: master is 8000.000000
+I1209 03:34:20.300129       1 log.go:245] CPU idle rate of node: master is 0.957878
+I1209 03:34:20.300869       1 log.go:245] Total memory of node: master is 15991.886719 MB
+I1209 03:34:20.301715       1 log.go:245] Memory available of node: master is 0.693416
+I1209 03:34:20.303093       1 log.go:245] Network available of node: master is 2.780608
+I1209 03:34:20.303696       1 log.go:245] Total disk of node: master is 78306.820312 MB
+I1209 03:34:20.304331       1 log.go:245] Disk available of node: master is 20.877547
+I1209 03:34:20.304340       1 log.go:245] Node Name: master LB Score: -28386.004252
+I1209 03:34:20.475914       1 log.go:245] ADF Get Last N Lines Latency Success, From Node node1 To master
+I1209 03:34:20.508610       1 log.go:245] ADF Get ADFScore Success from RemoteServer, from Node node1 To Node master: 12.578812
+I1209 03:34:20.691741       1 log.go:245] FutureScore Get Last N Lines Latency Success, From Node node1 To master
+I1209 03:34:20.750974       1 log.go:245] FutureScore Get Success from RemoteServer, from Node node1 To Node master: -4.187064
+I1209 03:34:20.752174       1 log.go:245] Total CPU of node: node3 is 8000.000000
+I1209 03:34:20.753353       1 log.go:245] CPU idle rate of node: node3 is 0.994408
+I1209 03:34:20.754262       1 log.go:245] Total memory of node: node3 is 15991.820312 MB
+I1209 03:34:20.755143       1 log.go:245] Memory available of node: node3 is 0.939870
+I1209 03:34:20.756697       1 log.go:245] Network available of node: node3 is 3.859632
+I1209 03:34:20.757507       1 log.go:245] Total disk of node: node3 is 78306.820312 MB
+I1209 03:34:20.758394       1 log.go:245] Disk available of node: node3 is 52.942462
+I1209 03:34:20.758407       1 log.go:245] Node Name: node3 LB Score: -195618.290413
+I1209 03:34:20.934777       1 log.go:245] ADF Get Last N Lines Latency Success, From Node node1 To node3
+I1209 03:34:20.960013       1 log.go:245] ADF Get ADFScore Success from RemoteServer, from Node node1 To Node node3: 10.683871
+I1209 03:34:21.137137       1 log.go:245] FutureScore Get Last N Lines Latency Success, From Node node1 To node3
+I1209 03:34:21.206170       1 log.go:245] FutureScore Get Success from RemoteServer, from Node node1 To Node node3: -4.912061
+I1209 03:34:21.206279       1 log.go:245] Node node2 Final Score before Normalized 100
+I1209 03:34:21.206301       1 log.go:245] Node master Final Score before Normalized 200
+I1209 03:34:21.206333       1 log.go:245] Node node3 Final Score before Normalized 124
+I1209 03:34:21.206376       1 log.go:245] Node 1 Normalized Score is 0
+I1209 03:34:21.206381       1 log.go:245] Node 2 Normalized Score is 100
+I1209 03:34:21.206384       1 log.go:245] Node 3 Normalized Score is 0
+I1209 03:34:21.206433       1 trace.go:236] Trace[1019969039]: "Scheduling" namespace:k8s-learn,name:nginx-deployment-test-neilats-586b9b9ccf-gfcpl (09-Dec-2025 03:34:17.549) (total time: 3656ms):
+Trace[1019969039]: ---"Computing predicates done" 2284ms (03:34:19.833)
+Trace[1019969039]: ---"Prioritizing done" 1372ms (03:34:21.206)
+Trace[1019969039]: [3.65687836s] [3.65687836s] END
+
+~~~
+

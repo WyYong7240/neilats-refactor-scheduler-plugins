@@ -24,8 +24,8 @@ SCHEDULER_DIR="${SCRIPT_ROOT}"/build/scheduler
 CONTROLLER_DIR="${SCRIPT_ROOT}"/build/controller
 
 REGISTRY=${REGISTRY:-"wuyong7240/scheduler-plugins"}
-IMAGE=${IMAGE:-"neilats-refactor-scheduler:v2.8"}
-CONTROLLER_IMAGE=${CONTROLLER_IMAGE:-"neilats-refactor-controller:v2.8"}
+IMAGE=${IMAGE:-"neilats-refactor-scheduler:v3beta3"}
+CONTROLLER_IMAGE=${CONTROLLER_IMAGE:-"neilats-refactor-controller:v3beta3"}
 RELEASE_VERSION=${RELEASE_VERSION:-"v0.0.0"}
 
 BUILDER=${BUILDER:-"docker"}
@@ -34,26 +34,26 @@ if ! command -v ${BUILDER} && command -v nerdctl >/dev/null; then
   BUILDER=nerdctl
 fi
 
-ARCH=${ARCH:-$(go env GOARCH)}
-if [[ "${ARCH}" == "arm64" ]]; then
-  ARCH="arm64v8"
+GO_ARCH=${GO_ARCH:-$(go env GOARCH)}
+if [[ "${GO_ARCH}" == "arm64" ]]; then
+  GO_ARCH="arm64v8"
 fi
 
 GO_BASE_IMAGE=${GO_BASE_IMAGE:-"golang"}
-ALPINE_BASE_IMAGE=${ALPINE_BASE_IMAGE:-"$ARCH/alpine"}
+ALPINE_BASE_IMAGE=${ALPINE_BASE_IMAGE:-"$GO_ARCH/alpine"}
 
 cd "${SCRIPT_ROOT}"
 
 ${BUILDER} build \
            -f ${SCHEDULER_DIR}/Dockerfile \
-           --build-arg ARCH=${ARCH} \
+           --build-arg ARCH=${GO_ARCH} \
            --build-arg RELEASE_VERSION=${RELEASE_VERSION} \
            --build-arg GO_BASE_IMAGE=${GO_BASE_IMAGE} \
            --build-arg ALPINE_BASE_IMAGE=${ALPINE_BASE_IMAGE} \
            -t ${REGISTRY}/${IMAGE} .
 ${BUILDER} build \
            -f ${CONTROLLER_DIR}/Dockerfile \
-           --build-arg ARCH=${ARCH} \
+           --build-arg ARCH=${GO_ARCH} \
            --build-arg RELEASE_VERSION=${RELEASE_VERSION} \
            --build-arg GO_BASE_IMAGE=${GO_BASE_IMAGE} \
            --build-arg ALPINE_BASE_IMAGE=${ALPINE_BASE_IMAGE} \
